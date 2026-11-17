@@ -1,264 +1,189 @@
 """
-Realistic 2D phantom of a hydrate-bearing sandstone core, and a simple CT forward model.
+2D CT phantom of a sandstone core with water, CO2 hydrate and CO2 in the pores.
 
-Builds on the sandstone_image() function in beam_hardening_basics.ipynb and adds
-  1. brine whose salinity rises as water converts to hydrate
-  2. a CO2 phase in the pores (liquid or gas)
-  3. five hydrate morphologies (coating, filling, cementing, porous, patchy)
-  4. phase volumes set by initial water saturation Sw0 and conversion fraction conv
-  5. block averaging to medical-CT voxel size and the CT_wet / CT_dry saturation estimate
-  6. an optional aluminium pressure sleeve
-  7. Poisson noise that actually reaches the reconstruction
-  8. optional polychromatic projection (for beam-hardening tests)
-
-Units: lengths in mm, mu in 1/mm, energies in keV.
+Change the four inputs below and run the file. Units: mm, 1/mm, keV.
 """
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy import ndimage as ndi
 from skimage.transform import radon, iradon
-from skimage.segmentation import watershed
-from skimage.feature import peak_local_max
-from skimage.morphology import disk
-import xraylib as x
+import xraylib as xrl
 
-# Material label numbers used in the label map
-OUTSIDE, QUARTZ, BRINE, HYDRATE, CO2, SLEEVE = 0, 1, 2, 3, 4, 5
-NAMES = {OUTSIDE: "outside", QUARTZ: "quartz", BRINE: "brine",
-         HYDRATE: "hydrate", CO2: "CO2", SLEEVE: "sleeve"}
+# ---- inputs
+# the core starts fully water saturated; hydrate and CO2 then take part of the pore space
+S_H = 0.45                                           # hydrate saturation (fraction of pore volume)
+S_CO2 = 0.05                                         # free CO2 saturation
+S_w = 1 - S_H - S_CO2                               # water left over
+energy = 120.0                                      # beam energy [keV]
+N0 = None                                            # photons per detector pixel per projection (None = no noise)
+theta = np.linspace(0, 180, 360, endpoint=False)    # projection angles [deg]
 
+# ---- fixed sample
+n_pixel, pixel_size = 512, 0.01                     # 10 um pixels -> 5.12 mm image
+core_radius, grain_radius, porosity = 2.4, 0.12, 0.23
 
-# ----------------------------------------------------------------------------
-# Attenuation
-# ----------------------------------------------------------------------------
-def brine_density(wt):
-    """Approximate NaCl brine density [g/cm^3] at ~0-5 C. wt is the mass fraction of NaCl."""
-    return 1.0 + 0.71 * wt
+QUARTZ, WATER, HYDRATE, CO2 = 1, 2, 3, 4
+MATERIALS = {QUARTZ:  ("SiO2", 2.65),               # (formula, density [g/cm^3])
+             WATER:   ("H2O", 1.00),
+             HYDRATE: ("CO2(H2O)6.08", 1.09),       # n_h and density from the medical CT paper
+             CO2:     ("CO2", 0.07)}                # CO2 gas at ~30 bar, 1 C
 
-
-def mu_compound(formula, density, energy_kev):
-    """Linear attenuation [1/mm] from xraylib (total, incl. coherent scattering)."""
-    return x.CS_Total_CP(formula, energy_kev) * density / 10
-
-
-def mu_brine(wt, energy_kev):
-    """Linear attenuation [1/mm] of NaCl brine with salt mass fraction wt."""
-    mass_mu = wt * x.CS_Total_CP("NaCl", energy_kev) + (1 - wt) * x.CS_Total_CP("H2O", energy_kev)
-    return mass_mu * brine_density(wt) / 10
+# ---- hydrate growth
+EXPANSION = 1.26    # hydrate volume / volume of water it consumed (Almenningen et al. 2021)
+N_NUCLEI = 50       # nucleation sites on the water-CO2 interface
+LATERAL = 5         # the hydrate film spreads this many times faster along the interface than it thickens
 
 
-def material_mus(energy_kev, salinity, n_h=6.08, rho_hydrate=1.09, rho_co2=0.07):
+def make_core(S_H, S_CO2, seed=0):
     """
-    mu [1/mm] for every label at one energy.
-    salinity    : NaCl mass fraction of the brine that is LEFT in the pores
-    n_h         : hydration number (6.08 from the medical CT paper, ideal sI is 5.75)
-    rho_co2     : CO2 density [g/cm^3]. ~0.07 for gas at 30 bar and 1 C (default),
-                  ~0.9 for liquid CO2, ~0.0012 for air in a dry reference scan
+    Label map, built in the order things happen in the experiment:
+      1. sandstone: random overlapping quartz grains, pores 100 % water
+      2. CO2 injected into the water-wet rock: CO2 pushes water out of the widest pores first
+         (capillary drainage), water stays in the narrow throats, grain contacts and corners
+      3. hydrate nucleates at a few random points on the water-CO2 interface, spreads quickly
+         along the interface as a film, then thickens slowly. It mostly eats into the water,
+         and since it takes up 26 % more volume than that water, it also grows into the CO2.
+    S_H and S_CO2 are the saturations at the end; water fills the rest.
     """
-    return {OUTSIDE: 0.0,
-            QUARTZ:  mu_compound("SiO2", 2.65, energy_kev),
-            BRINE:   mu_brine(salinity, energy_kev),
-            HYDRATE: mu_compound(f"CO2(H2O){n_h}", rho_hydrate, energy_kev),
-            CO2:     mu_compound("CO2", rho_co2, energy_kev),
-            SLEEVE:  mu_compound("Al", 2.70, energy_kev)}
-
-
-# ----------------------------------------------------------------------------
-# Grains
-# ----------------------------------------------------------------------------
-def make_grains(n_pixel, pixel_size, core_radius, porosity=0.23, grain_radius=0.12, seed=None):
-    """Random overlapping quartz disks inside a round core until the porosity is reached."""
+    if S_H + S_CO2 > 1 or min(S_H, S_CO2) < 0:
+        raise ValueError("need S_H, S_CO2 >= 0 and S_H + S_CO2 <= 1")
+    S_w = 1 - S_H - S_CO2
     rng = np.random.default_rng(seed)
     yy, xx = np.mgrid[:n_pixel, :n_pixel]
     c = (n_pixel - 1) / 2
     core = np.hypot(xx - c, yy - c) <= core_radius / pixel_size
 
-    grain = np.zeros((n_pixel, n_pixel), bool)
-    r_px = grain_radius / pixel_size
+    grain = np.zeros(core.shape, bool)
     while (~grain[core]).mean() > porosity:
         x0, y0 = rng.uniform(0, n_pixel, 2)
-        r = r_px * rng.uniform(0.7, 1.3)
-        # only update a small window around the new grain (much faster than the full grid)
-        y_lo, y_hi = int(max(y0 - r - 1, 0)), int(min(y0 + r + 2, n_pixel))
-        x_lo, x_hi = int(max(x0 - r - 1, 0)), int(min(x0 + r + 2, n_pixel))
-        sub_y, sub_x = yy[y_lo:y_hi, x_lo:x_hi], xx[y_lo:y_hi, x_lo:x_hi]
-        grain[y_lo:y_hi, x_lo:x_hi] |= (sub_x - x0)**2 + (sub_y - y0)**2 <= r**2
+        r = grain_radius / pixel_size * rng.uniform(0.7, 1.3)
+        grain |= (xx - x0)**2 + (yy - y0)**2 <= r**2
     grain &= core
+
     pore = core & ~grain
-    return grain, pore, core
 
-
-# ----------------------------------------------------------------------------
-# Hydrate placement: each morphology is just an ORDER in which pore pixels turn into hydrate
-# ----------------------------------------------------------------------------
-def split_pores(pore, min_distance=4):
-    """Split the pore space into individual pores (watershed on the distance map)."""
-    d = ndi.distance_transform_edt(pore)
-    peaks = peak_local_max(d, min_distance=min_distance, labels=pore)
-    markers = np.zeros(pore.shape, int)
-    markers[tuple(peaks.T)] = np.arange(1, len(peaks) + 1)
-    return watershed(-d, markers, mask=pore)
-
-
-def hydrate_order(morphology, grain, pore, pixel_size, rng):
-    """
-    Return the flat indices of pore pixels in the order they become hydrate.
-      coating   : nearest to grains first (thin layer on the grain surfaces)
-      filling   : whole pores, one at a time (non-porous, pathway B)
-      cementing : narrow necks and grain contacts first
-      porous    : a shell around CO2 in the pore centres (pathway A)
-      patchy    : everything near a random point first (hydrate only in one region)
-    """
+    # 2. capillary drainage. Pore size of a pixel = radius of the largest disk that fits in the
+    #    pore space and covers the pixel (morphological opening, done with distance transforms)
+    d_wall = ndi.distance_transform_edt(pore)
+    size = np.zeros(pore.shape)
+    for r in range(1, int(d_wall.max()) + 1):
+        size[ndi.distance_transform_edt(d_wall < r) <= r] = r
     idx = np.flatnonzero(pore)
-    d_grain = ndi.distance_transform_edt(~grain).flat[idx]          # distance to nearest grain [px]
+    idx = idx[np.lexsort((-d_wall.flat[idx], -size.flat[idx]))]   # widest pores first, centres first
+    n_h, n_w = round(S_H * idx.size), round(S_w * idx.size)
+    n_w0 = n_w + round(n_h / EXPANSION)                            # water before hydrate formed
+    labels = np.where(grain, QUARTZ, 0)
+    labels.flat[idx[:idx.size - n_w0]] = CO2
+    labels.flat[idx[idx.size - n_w0:]] = WATER
 
-    if morphology == "coating":
-        return idx[np.argsort(d_grain, kind="stable")]
-
-    if morphology == "filling":
-        pores = split_pores(pore).flat[idx]
-        pore_ids = rng.permutation(np.unique(pores[pores > 0]))
-        rank = np.empty(pores.max() + 1)
-        rank[pore_ids] = np.arange(len(pore_ids))
-        return idx[np.lexsort((d_grain, rank[pores]))]               # pore by pore, each filled fully
-
-    if morphology == "cementing":
-        # a pixel's rank is the smallest closing radius that turns it solid: contacts close first
-        closing_rank = np.full(idx.size, np.inf)
-        for k in range(1, 30):
-            closed = ndi.binary_closing(grain, structure=disk(k), border_value=1).flat[idx]
-            closing_rank[(closing_rank == np.inf) & closed] = k
-        return idx[np.lexsort((d_grain, closing_rank))]
-
-    if morphology == "porous":
-        # caller puts CO2 in the pore centres first; hydrate then takes the next layer outwards
-        return idx[np.argsort(-d_grain, kind="stable")]
-
-    if morphology == "patchy":
-        rows, cols = np.unravel_index(idx, pore.shape)
-        y0, x0 = rows[rng.integers(idx.size)], cols[rng.integers(idx.size)]
-        return idx[np.argsort(np.hypot(rows - y0, cols - x0), kind="stable")]
-
-    raise ValueError(f"unknown morphology {morphology!r}")
+    # 3. hydrate growth: arrival time of the growth front = distance from the interface (thickening)
+    #    + distance from the nearest nucleus / LATERAL (fast film spreading along the interface)
+    if n_h > 0:
+        water, co2 = labels == WATER, labels == CO2
+        d_int = np.where(water, ndi.distance_transform_edt(~co2), ndi.distance_transform_edt(~water))
+        interface = np.flatnonzero(water & ndi.binary_dilation(co2))
+        not_nucleus = np.ones(pore.shape, bool)
+        not_nucleus.flat[rng.choice(interface, min(N_NUCLEI, interface.size), replace=False)] = False
+        t = d_int + ndi.distance_transform_edt(not_nucleus) / LATERAL
+        for phase, n in ((water, n_w0 - n_w), (co2, n_h - (n_w0 - n_w))):
+            p = np.flatnonzero(phase)
+            labels.flat[p[np.argsort(t.flat[p], kind="stable")[:n]]] = HYDRATE
+    return labels
 
 
-# ----------------------------------------------------------------------------
-# Full sample
-# ----------------------------------------------------------------------------
-def hydrate_core(n_pixel=512, pixel_size=0.01, core_radius=2.2, sleeve_thickness=0.3,
-                 porosity=0.23, grain_radius=0.12,
-                 Sw0=0.5, conv=0.8, expansion=1.26, salinity0=0.035,
-                 morphology="coating", seed=None):
+def mu_map(labels, energy):
+    """Linear attenuation [1/mm] for each pixel at one beam energy."""
+    mu = np.zeros(labels.shape)
+    for lab, (formula, rho) in MATERIALS.items():
+        mu[labels == lab] = xrl.CS_Total_CP(formula, float(energy)) * rho / 10
+    return mu
+
+
+def scan(mu, theta, N0):
     """
-    Label map of a hydrate-bearing core.
-
-    Sw0        : water saturation before hydrate forms
-    conv       : fraction of that water converted to hydrate
-    expansion  : hydrate volume / water volume it came from (1.26, Almenningen et al. 2021)
-    salinity0  : initial NaCl mass fraction. Salt is excluded from hydrate, so the remaining
-                 brine becomes saltier: salinity = salinity0 / (1 - conv) (capped at 0.26, halite saturation)
-
-    Returns labels (int array), info (dict with true saturations and salinity).
+    Detector measurement: Beer-Lambert with Poisson photon noise, then back to line integrals.
+    radon() sums mu over pixels, so multiply by pixel_size to get the dimensionless line integral.
     """
-    rng = np.random.default_rng(seed)
-    grain, pore, core = make_grains(n_pixel, pixel_size, core_radius, porosity, grain_radius, seed)
-    n_pore = pore.sum()
-
-    # Phase volumes in pore pixels
-    S_H = expansion * conv * Sw0
-    S_w = (1 - conv) * Sw0
-    if S_H + S_w > 1:
-        raise ValueError("hydrate + brine exceeds the pore volume; lower Sw0 or conv")
-    n_hyd, n_wat = int(round(S_H * n_pore)), int(round(S_w * n_pore))
-    n_co2 = n_pore - n_hyd - n_wat
-
-    labels = np.zeros(pore.shape, int)
-    labels[grain] = QUARTZ
-    free = pore.copy()
-
-    # Porous hydrate: CO2 bubbles sit in the pore centres and the hydrate shell grows around them
-    if morphology == "porous":
-        idx = np.flatnonzero(free)
-        d = ndi.distance_transform_edt(~grain).flat[idx]
-        co2_idx = idx[np.argsort(-d, kind="stable")][:n_co2]
-        labels.flat[co2_idx] = CO2
-        free.flat[co2_idx] = False
-        n_co2 = 0
-
-    # Hydrate
-    order = hydrate_order(morphology, grain, free, pixel_size, rng)
-    labels.flat[order[:n_hyd]] = HYDRATE
-    free.flat[order[:n_hyd]] = False
-
-    # Water-wet rock: brine in the corners near grains, CO2 in what is left (pore centres)
-    idx = np.flatnonzero(free)
-    d = ndi.distance_transform_edt(~grain).flat[idx]
-    idx = idx[np.argsort(d, kind="stable")]
-    labels.flat[idx[:n_wat]] = BRINE
-    labels.flat[idx[n_wat:]] = CO2
-
-    # Pressure sleeve
-    if sleeve_thickness > 0:
-        yy, xx = np.mgrid[:n_pixel, :n_pixel]
-        c = (n_pixel - 1) / 2
-        r = np.hypot(xx - c, yy - c) * pixel_size
-        labels[(r > core_radius) & (r <= core_radius + sleeve_thickness)] = SLEEVE
-
-    salinity = min(salinity0 / max(1 - conv, 1e-9), 0.26)
-    info = {"S_H": (labels == HYDRATE).sum() / n_pore,
-            "S_w": (labels == BRINE).sum() / n_pore,
-            "S_co2": (labels == CO2).sum() / n_pore,
-            "salinity": salinity, "conv": conv, "Sw0": Sw0,
-            "pore": pore, "core": core}
-    return labels, info
-
-
-def mu_image(labels, mus):
-    """Turn a label map into a mu map [1/mm]."""
-    img = np.zeros(labels.shape)
-    for lab, mu in mus.items():
-        img[labels == lab] = mu
-    return img
-
-
-# ----------------------------------------------------------------------------
-# Forward model and reconstruction
-# ----------------------------------------------------------------------------
-def scan(labels, pixel_size, theta, energies_kev, weights, N0=1e5, mus_kwargs=None, rng=None):
-    """
-    Simulated CT scan. Monochromatic if energies_kev has one value.
-    Projects each material mask once (path length per ray), then applies Beer-Lambert per
-    energy bin and sums over the spectrum, so beam hardening comes out by itself.
-    Returns the noisy sinogram -ln(I/I0) / pixel_size, ready for iradon.
-    """
-    rng = np.random.default_rng(rng)
-    mus_kwargs = mus_kwargs or {}
-    weights = np.asarray(weights, float) / np.sum(weights)
-
-    # path length through each material [mm] for every ray
-    paths = {lab: radon((labels == lab).astype(float), theta=theta) * pixel_size
-             for lab in np.unique(labels) if lab != OUTSIDE}
-
-    I = 0.0
-    for E, w in zip(np.atleast_1d(energies_kev), weights):
-        mus = material_mus(float(E), **mus_kwargs)
-        I = I + w * np.exp(-sum(mus[lab] * L for lab, L in paths.items()))
-
-    counts = np.maximum(rng.poisson(N0 * I), 1)                 # Poisson noise, avoid log(0)
+    line_integral = radon(mu, theta=theta) * pixel_size
+    if N0 is None:
+        return line_integral / pixel_size
+    rng = np.random.default_rng(1)
+    counts = np.maximum(rng.poisson(N0 * np.exp(-line_integral)), 1)   # avoid log(0)
     return -np.log(counts / N0) / pixel_size
 
 
-def reconstruct(sinogram, theta):
-    return iradon(sinogram, theta=theta, filter_name="ramp")
+labels = make_core(S_H, S_CO2)
+mu = mu_map(labels, energy)
+sinogram = scan(mu, theta, N0)
+recon = iradon(sinogram, theta=theta, filter_name="ramp")
 
+# mean reconstructed value per phase (eroded masks, so edges and partial pixels don't count)
+for lab, name in ((QUARTZ, "quartz"), (WATER, "water"), (HYDRATE, "hydrate"), (CO2, "CO2")):
+    m = ndi.binary_erosion(labels == lab, iterations=2)
+    if m.any():
+        print(f"{name:8s} true mu {mu[labels == lab].mean():.5f}   recon {recon[m].mean():.5f} "
+              f"+- {recon[m].std():.5f} 1/mm")
 
-def block_average(img, block):
-    """Average block x block pixels, e.g. 10 um pixels -> 0.3 mm medical-CT voxels (block = 30)."""
-    n = (img.shape[0] // block) * block
-    return img[:n, :n].reshape(n // block, block, n // block, block).mean(axis=(1, 3))
+ext = (0, n_pixel * pixel_size, n_pixel * pixel_size, 0)
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+axes = axes.ravel()                                    # axes[0] ... axes[5], row by row
+cmap = plt.matplotlib.colors.ListedColormap(["white", "tan", "tab:blue", "tab:red", "lightgrey"])
 
+# 1. sample
+axes[0].imshow(labels, cmap=cmap, vmin=-0.5, vmax=4.5, interpolation="nearest", extent=ext)
+axes[0].set_title(f"Sample: $S_H$={S_H}, $S_{{CO_2}}$={S_CO2}, $S_w$={S_w:.2f}")
+axes[0].legend(handles=[plt.Rectangle((0, 0), 1, 1, color=cmap(i)) for i in (1, 2, 3, 4)],
+               labels=["quartz", "water", "hydrate", "CO$_2$"], loc="upper right", fontsize=8)
 
-def medical_ct_saturation(rec_exp, rec_dry, rec_wet):
-    """S_{w+H} = (CT_exp - CT_dry) / (CT_wet - CT_dry), as in the medical CT paper (their eq. 1)."""
-    num, den = rec_exp - rec_dry, rec_wet - rec_dry
-    # voxels outside the reconstruction circle are exactly 0 in all three scans -> NaN, not a 0/0 warning
-    return np.divide(num, den, out=np.full_like(den, np.nan, dtype=float), where=den != 0)
+# 2. sinogram
+axes[1].imshow(sinogram, cmap="Greys_r", aspect="auto", extent=(theta[0], theta[-1], sinogram.shape[0], 0))
+axes[1].set_title(f"Sinogram, {len(theta)} projections")
+axes[1].set_xlabel("angle [deg]")
+
+# 3. reconstruction, narrow window around water and hydrate
+mu_w, mu_h = mu[labels == WATER].mean(), mu[labels == HYDRATE].mean()
+contrast = mu_h - mu_w
+im = axes[2].imshow(recon, cmap="Greys_r", vmin=mu_w - 0.5 * contrast, vmax=mu_h + 0.5 * contrast, extent=ext)
+axes[2].set_title(f"Reconstruction at {energy:g} keV\nnarrow window (water vs hydrate)")
+fig.colorbar(im, ax=axes[2], label=r"$\mu$ [1/mm]")
+
+# 4. error map, colour scale = +- hydrate-water contrast
+pore = np.isin(labels, [WATER, HYDRATE, CO2])
+error = recon - mu
+rms_pore = np.sqrt(np.mean(error[pore]**2))
+im = axes[3].imshow(error, cmap="Greys_r", vmin=-contrast, vmax=contrast, extent=ext)
+axes[3].set_title(f"Reconstruction error\nRMS in pores: {rms_pore:.1e} /mm")
+fig.colorbar(im, ax=axes[3], label=r"$\Delta\mu$ [1/mm]")
+
+# 5. contrast between hydrate and water as a function of photon energy
+energies = np.linspace(15, 150, 200)                                       # [keV]
+mu_curve = {lab: np.array([xrl.CS_Total_CP(MATERIALS[lab][0], E) * MATERIALS[lab][1] / 10 for E in energies])
+            for lab in (WATER, HYDRATE)}
+diff = mu_curve[HYDRATE] - mu_curve[WATER]                                 # absolute contrast [1/mm]
+rel = 100 * diff / mu_curve[WATER]                                         # relative contrast [%]
+ax = axes[4]
+ax.plot(energies, rel, color="tab:red")
+ax.set_xlabel("Photon energy [keV]")
+ax.set_ylabel(r"Relative contrast $(\mu_H - \mu_w)/\mu_w$ [%]", color="tab:red")
+ax.set_ylim(0, 1.2 * rel.max())
+ax2 = ax.twinx()
+ax2.semilogy(energies, diff, color="tab:blue")
+ax2.set_ylabel(r"Absolute contrast $\mu_H - \mu_w$ [1/mm]", color="tab:blue")
+ax.axvline(energy, color="grey", ls="--", lw=1)
+ax.set_title(f"Hydrate vs water contrast\n(dashed line: {energy:g} keV used above)")
+
+# 6. reconstruction error for several energies
+energies_test = np.arange(20, 151, 10)                                     # [keV]
+rms_all = []
+for E in energies_test:
+    mu_test = mu_map(labels, E)
+    rec_test = iradon(radon(mu_test, theta=theta), theta=theta, filter_name="ramp")
+    rms_all.append(np.sqrt(np.mean((rec_test - mu_test)**2)))
+axes[5].semilogy(energies_test, rms_all, "o-")
+axes[5].axvline(energy, color="grey", ls="--", lw=1)
+axes[5].set_xlabel("Photon energy [keV]")
+axes[5].set_ylabel("RMS reconstruction error [1/mm]")
+axes[5].set_title("Reconstruction error vs photon energy")
+
+fig.tight_layout()
+plt.show()
