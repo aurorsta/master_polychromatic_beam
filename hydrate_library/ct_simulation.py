@@ -132,7 +132,7 @@ geometry = nect.Geometry(
     mode="cone", angles_type="radians",
 )
 path = nect.reconstruct(geometry=geometry, projections=str(here / "projections.npy"),
-                        quality="high", mode="dynamic")
+                        quality="high", mode="dynamic", model="mixedcubes")
 print("reconstruction saved in", path)
 '''
 
