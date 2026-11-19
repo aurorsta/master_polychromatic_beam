@@ -3,7 +3,7 @@
 
 The two classes are used one after the other, in the order of the experiment:
 
-    core = CoreSample(height=2.0, radius=1.0, porosity=0.23, grain_radius=0.12)
+    core = CoreSample(height=2.0, radius=1.0, porosity=0.23, grain_radius=0.12, salinity=0.0)
     core.cylinder()                               # the empty cylinder
     core.make_sample()                            # grains and pore space inside it
     core.set_start_water_saturation(1.0)          # pores fully water saturated at t = 0
@@ -18,23 +18,32 @@ The two classes are used one after the other, in the order of the experiment:
 Every voxel stores the time at which CO2 and hydrate reach it, so the state at any time is a cheap lookup.
 Arrays are [z, y, x]: z is the core axis (and the scanner's rotation axis), CO2 enters at z = 0.
 Units: mm, 1/mm, keV, s, MPa, K.
+
+Needs PoreSpy >= 3.3 (its qbip removes trapped water when outlets are given). scikit-fmm is optional;
+without it distances fall back to 26-neighbour steps.
 """
+import warnings
 import numpy as np
 from scipy import ndimage as ndi
 import xraylib as xrl
 
+try:
+    import skfmm
+except ImportError:
+    skfmm = None
+
 # ---------------------------------------------------------------------------------------------------------
 # Materials
 # ---------------------------------------------------------------------------------------------------------
-# name -> (chemical formula, density [g/cm^3])
+# name -> ({chemical formula: weight fraction}, density [g/cm^3])
 MATERIALS = {
-    "water":     ("H2O",           1.000),
-    "ice":       ("H2O",           0.917),
-    "hydrate":   ("CO2(H2O)6.08",  1.09),
-    "CO2 gas":   ("CO2",           0.07),
-    "quartz":    ("SiO2",          2.65),
-    "feldspar":  ("KAlSi3O8",      2.56),
-    "kaolinite": ("Al2Si2O5(OH)4", 2.60),
+    "water":     ({"H2O": 1.0},           1.000),
+    "ice":       ({"H2O": 1.0},           0.917),
+    "hydrate":   ({"CO2(H2O)6.08": 1.0},  1.09),
+    "CO2 gas":   ({"CO2": 1.0},           0.07),    # default only; HydrateGrowth uses the EOS density
+    "quartz":    ({"SiO2": 1.0},          2.65),
+    "feldspar":  ({"KAlSi3O8": 1.0},      2.56),
+    "kaolinite": ({"Al2Si2O5(OH)4": 1.0}, 2.60),
 }
 
 # Bentheimer grain composition, XRD weight fractions (Peksa et al. 2015, Table 1, "Bentheimer sandstone revisited for experimental purposes").
@@ -54,22 +63,63 @@ N_H, RHO_H = 6.08, 1.09
 M_H2O, M_CO2 = 18.015, 44.01                                     # molar masses [g/mol]
 EXPANSION = ((M_H2O + M_CO2 / N_H) / RHO_H) / M_H2O
 
+# CO2 critical point and acentric factor
+TC_CO2, PC_CO2, OMEGA_CO2 = 304.1282, 7.3773, 0.22394           # [K], [MPa], [-]
+R_GAS = 8.314462618                                             # [J/mol/K]
 
-def mu(name, energy):
-    """Linear attenuation [1/mm] of a material at one or several energies [keV]."""
-    if name == "sandstone":
-        return sum(f * mu(m, energy) for m, f in SANDSTONE.items())  # volume-weighted average of the minerals
-    formula, rho = MATERIALS[name]
+
+def brine(salt="NaCl", wt=0.0, density=None):
+    """
+    Composition and density of a brine with `wt` weight fraction of `salt`.
+    Default density is 1 + 0.7 wt, good to ~0.5 % for NaCl up to 10 wt %; give `density` for other salts (KI, CsCl ...).
+    """
+    if wt == 0:
+        return MATERIALS["water"]
+    return {"H2O": 1 - wt, salt: wt}, (1 + 0.7 * wt if density is None else density)
+
+
+def co2_vapour_pressure(T):
+    """Saturation pressure of CO2 [MPa] at T [K] (Span and Wagner 1996 ancillary equation)."""
+    tau = 1 - T / TC_CO2
+    return PC_CO2 * np.exp(TC_CO2 / T * (-7.0602087 * tau + 1.9391218 * tau**1.5
+                                          - 1.6463597 * tau**2 - 3.2995634 * tau**4))
+
+
+def co2_gas_density(P, T):
+    """Density of CO2 gas [g/cm^3] at P [MPa], T [K] from the Peng-Robinson equation of state (vapour root)."""
+    kappa = 0.37464 + 1.54226 * OMEGA_CO2 - 0.26992 * OMEGA_CO2**2
+    alpha = (1 + kappa * (1 - np.sqrt(T / TC_CO2)))**2
+    a = 0.45724 * R_GAS**2 * TC_CO2**2 / (PC_CO2 * 1e6) * alpha
+    b = 0.07780 * R_GAS * TC_CO2 / (PC_CO2 * 1e6)
+    A, B = a * P * 1e6 / (R_GAS * T)**2, b * P * 1e6 / (R_GAS * T)
+    Z = np.roots([1, B - 1, A - 3 * B**2 - 2 * B, -(A * B - B**2 - B**3)])
+    Z = Z[np.isreal(Z)].real.max()                                 # largest root = vapour
+    return P * 1e6 * M_CO2 / (Z * R_GAS * T) / 1e6                 # [g/m^3] -> [g/cm^3]
+
+
+def mu(material, energy):
+    """
+    Linear attenuation [1/mm] of a material at one or several energies [keV].
+    `material` is a name in MATERIALS, "sandstone", or a (composition, density) pair.
+    """
+    if isinstance(material, str):
+        if material == "sandstone":
+            return sum(f * mu(m, energy) for m, f in SANDSTONE.items())  # volume-weighted average of the minerals
+        material = MATERIALS[material]
+    comp, rho = material
     E = np.atleast_1d(np.asarray(energy, float))
-    out = np.array([xrl.CS_Total_CP(formula, float(e)) * rho / 10 for e in E])  # [cm^2/g]*[g/cm^3] = [1/cm], /10 -> [1/mm]
+    out = np.array([sum(w * xrl.CS_Total_CP(f, float(e)) for f, w in comp.items()) * rho / 10 for e in E])
     return out if np.ndim(energy) else out[0]
 
 
-def mu_map(labels, energy):
-    """Linear attenuation [1/mm] of every voxel in a label array, at one energy [keV]."""
+def mu_map(labels, energy, materials=None):
+    """
+    Linear attenuation [1/mm] of every voxel in a label array, at one energy [keV].
+    `materials` overrides the material of some labels: {label: name or (composition, density)}.
+    """
     table = np.zeros(max(LABEL_MATERIAL) + 1)
     for lab, name in LABEL_MATERIAL.items():
-        table[lab] = mu(name, energy)
+        table[lab] = mu((materials or {}).get(lab, name), energy)
     return table[labels]
 
 
@@ -77,6 +127,33 @@ def saturations(labels):
     """Fraction of the pore volume filled with water, CO2 and hydrate."""
     n_pore = np.isin(labels, (WATER, CO2, HYDRATE)).sum()
     return {name: (labels == lab).sum() / n_pore for lab, name in ((WATER, "water"), (CO2, "CO2"), (HYDRATE, "hydrate"))}
+
+
+def pore_distance(source, medium, voxel_size=1.0):
+    """
+    Distance from `source` to every voxel of `medium` [same unit as voxel_size], moving only through `medium`
+    (so the growth front goes around grains, not through them). inf where it cannot get to.
+    Uses the fast marching method (scikit-fmm) when available, else counts 26-neighbour steps.
+    """
+    if not source.any():
+        return np.full(source.shape, np.inf)
+    if skfmm is not None:
+        phi = np.ma.MaskedArray(np.where(source, -1.0, 1.0), mask=~(medium | source))
+        d = skfmm.distance(phi, dx=voxel_size)
+        dist = np.ma.filled(d + 0.5 * voxel_size, np.inf)        # +half a voxel: fmm measures from the contour
+        dist[source] = 0
+        dist[~(medium | source)] = np.inf
+        return dist
+    step = ndi.generate_binary_structure(3, 3)                      # 26 neighbours
+    dist = np.full(source.shape, np.inf)
+    dist[source] = 0
+    front, reached, k = source.copy(), source.copy(), 0
+    while front.any():
+        k += 1
+        front = ndi.binary_dilation(front, step) & medium & ~reached
+        dist[front] = k * voxel_size
+        reached |= front
+    return dist
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -91,12 +168,17 @@ class CoreSample:
     porosity       : pore volume / core volume
     grain_radius   : mean grain radius [mm]; each grain gets a radius of 0.7-1.3 times this
     composition    : mineral -> volume fraction of the grains (default Bentheimer)
+    salinity       : weight fraction of salt in the pore water (0 = pure water)
+    salt           : formula of the salt, e.g. "NaCl", or "KI" / "CsCl" as a CT contrast dopant
+    brine_density  : [g/cm^3]; None = NaCl estimate 1 + 0.7 * salinity
     """
 
     def __init__(self, height=2.0, radius=1.0, voxel_size=0.02, porosity=0.23, grain_radius=0.12,
-                 composition=SANDSTONE, seed=0):
+                 composition=SANDSTONE, salinity=0.0, salt="NaCl", brine_density=None, seed=0):
         self.height, self.radius, self.voxel_size = height, radius, voxel_size
         self.porosity, self.grain_radius, self.composition = porosity, grain_radius, dict(composition)
+        self.water = brine(salt, salinity, brine_density)
+        self.salinity, self.salt = salinity, salt
         self.seed = seed
         self.core = self.rock = self.pore = self.connected = None
         self.co2_time = None            # time [s] at which CO2 enters each voxel (inf = never)
@@ -159,7 +241,8 @@ class CoreSample:
         """
         Order in which a non-wetting phase (CO2) fills the water-wet pores when it is pushed in from the
         bottom: invasion percolation with PoreSpy (QBIP), the widest reachable opening first, stopped
-        at breakthrough at the top. Quasi-static: no pressure or velocity field.
+        at breakthrough at the top. Quasi-static: no pressure or velocity field. Passing the outlets makes
+        PoreSpy remove water that CO2 has cut off from the outlet (it cannot be displaced, water is incompressible).
         """
         if self._seq is None:
             import porespy as ps
@@ -167,9 +250,8 @@ class CoreSample:
             inlet[0] = self.connected[0]
             outlet = np.zeros_like(self.connected)
             outlet[-1] = self.connected[-1]
-            seq = np.asarray(ps.simulations.injection(im=self.connected, inlets=inlet, outlets=outlet,
-                                                      method="qbip").im_seq)
-            seq = np.where(self.connected & (seq > 0), seq, 0).astype(np.int64)
+            seq = np.asarray(ps.simulations.qbip(im=self.connected, inlets=inlet, outlets=outlet).im_seq)
+            seq = np.where(self.connected & (seq > 0), seq, 0).astype(np.int64)   # trapped = -1 -> 0
             at_outlet = seq[-1][seq[-1] > 0]
             if at_outlet.size:
                 seq[seq > at_outlet.min()] = 0             # stop at breakthrough
@@ -220,9 +302,12 @@ class CoreSample:
             labels[self.co2_time <= t] = CO2
         return labels
 
-    def mu_map(self, t, energy):
+    def mu_map(self, t, energy, co2_density=None):
         """Linear attenuation [1/mm] of every voxel at time t [s] and energy [keV]."""
-        return mu_map(self.labels_at(t), energy)
+        materials = {WATER: self.water}
+        if co2_density is not None:
+            materials[CO2] = (MATERIALS["CO2 gas"][0], co2_density)
+        return mu_map(self.labels_at(t), energy, materials)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -233,11 +318,14 @@ class HydrateGrowth:
     CO2 hydrate formation in a CoreSample, after the CO2 injection.
 
     From `start` the core is held at `pressure` [MPa] and `temperature` [K]. If that is inside the hydrate
-    stability zone, the first crystal appears after a random induction time. Hydrate then nucleates at a few
-    points on the water-CO2 interface, spreads quickly along the interface as a film and thickens slowly into
-    the water (diffusion limited, thickness ~ sqrt(t)). Both rates grow with the subcooling. Hydrate takes
-    ~29 % more volume than the water it consumes, so the extra volume grows into the CO2 next to it. The pump
-    keeps the pressure, so the CO2 used up is replaced.
+    stability zone, the first crystal appears after a random induction time, more likely the larger the
+    water-CO2 interface. Hydrate then nucleates at a few points on the interface, spreads quickly along it
+    as a film and thickens slowly into the water (diffusion limited, thickness ~ sqrt(t)). Both rates grow
+    with the subcooling. Hydrate takes ~29 % more volume than the water it consumes, so the extra volume
+    grows into the CO2 next to it. The pump keeps the pressure, so the CO2 used up is replaced.
+
+    Valid for liquid water + CO2 gas + hydrate only: T above the Q1 quadruple point (no ice) and P below the
+    CO2 vapour pressure (no liquid CO2). Outside that range the equilibrium line and gas density do not hold.
 
     pressure, temperature : conditions during growth [MPa], [K]
     n_nuclei              : nucleation sites on the interface
@@ -245,7 +333,9 @@ class HydrateGrowth:
     thickening_rate       : thickening constant per kelvin, thickness^2 = rate * dT * t [mm^2/s/K] (illustrative)
     max_conversion        : largest fraction of the water that can turn into hydrate
     induction_time        : waiting time [s] before nucleation; None = draw it from the nucleation model
-    J0, B                 : nucleation rate model J = J0 exp(-B / (T dT^2)) [1/h], [K^3] (illustrative)
+    J0, B                 : nucleation rate per interface area J = J0 exp(-B / (T dT^2)) [1/(mm^2 h)], [K^3] (illustrative)
+    salt_shift            : lowering of the hydrate equilibrium temperature by the salt [K]; take it from a
+                            correlation (e.g. Hu, Lee and Sum 2017) or measured data for the core's brine
     """
 
     # quadruple points (T [K], P [MPa]); the equilibrium curve between them is a straight line in ln P vs 1/T
@@ -253,11 +343,20 @@ class HydrateGrowth:
     Q2 = (283.0, 4.50)          # hydrate, liquid water, CO2 gas, liquid CO2
 
     def __init__(self, core, pressure=3.0, temperature=274.15, n_nuclei=50, film_rate=1e-3, thickening_rate=1e-6,
-                 max_conversion=0.9, induction_time=None, J0=1.0, B=1.2e4, seed=0):
+                 max_conversion=0.9, induction_time=None, J0=1.0, B=1.2e4, salt_shift=0.0, seed=0):
+        if temperature <= self.Q1[0]:
+            raise ValueError(f"T = {temperature} K is at or below Q1 ({self.Q1[0]} K): the water would freeze")
+        p_sat = co2_vapour_pressure(temperature)
+        if pressure >= p_sat:
+            raise ValueError(f"P = {pressure} MPa is above the CO2 vapour pressure at {temperature} K "
+                             f"({p_sat:.2f} MPa): CO2 would be liquid, which this model does not cover")
+        if core.salinity > 0 and salt_shift == 0:
+            warnings.warn("the pore water is saline but salt_shift = 0: the equilibrium is that of pure water")
         self.core = core
         self.pressure, self.temperature = pressure, temperature
+        self.co2_density = co2_gas_density(pressure, temperature)
         self.n_nuclei, self.film_rate, self.thickening_rate = n_nuclei, film_rate, thickening_rate
-        self.max_conversion, self.J0, self.B = max_conversion, J0, B
+        self.max_conversion, self.J0, self.B, self.salt_shift = max_conversion, J0, B, salt_shift
         self.rng = np.random.default_rng(seed)
         self._induction = induction_time
         self.hydrate_time = np.full(core.core.shape, np.inf)   # time [s] at which each voxel becomes hydrate
@@ -270,31 +369,45 @@ class HydrateGrowth:
 
     @classmethod
     def equilibrium_pressure(cls, T):
-        """Hydrate equilibrium pressure [MPa] at temperature T [K]."""
+        """Hydrate equilibrium pressure [MPa] at temperature T [K], pure water."""
         a, b = cls._fit()
         return np.exp(a + b / T)
 
     @classmethod
     def equilibrium_temperature(cls, P):
-        """Hydrate equilibrium temperature [K] at pressure P [MPa]."""
+        """Hydrate equilibrium temperature [K] at pressure P [MPa], pure water."""
         a, b = cls._fit()
         return b / (np.log(P) - a)
 
     def subcooling(self):
-        """Driving force: equilibrium temperature at the pressure minus the actual temperature [K]."""
-        return self.equilibrium_temperature(self.pressure) - self.temperature
+        """Driving force: equilibrium temperature at the pressure (lowered by salt) minus the actual temperature [K]."""
+        return self.equilibrium_temperature(self.pressure) - self.salt_shift - self.temperature
 
     def is_stable(self):
         return self.subcooling() > 0
 
-    def induction_time(self):
-        """Time [s] from entering the stability zone until the first crystal. Random (exponential), as nucleation is."""
+    @staticmethod
+    def interface_area(labels, voxel_size):
+        """Area of the water-CO2 interface [mm^2], counted as voxel faces between the two."""
+        n = 0
+        for ax in range(3):
+            a, b = np.swapaxes(labels, 0, ax)[1:], np.swapaxes(labels, 0, ax)[:-1]
+            n += np.sum((a == WATER) & (b == CO2)) + np.sum((a == CO2) & (b == WATER))
+        return n * voxel_size**2
+
+    def induction_time(self, labels=None):
+        """
+        Time [s] from entering the stability zone until the first crystal. Random (exponential), as nucleation is,
+        with a rate proportional to the water-CO2 interface area.
+        """
         if self._induction is not None:
             return self._induction
         if not self.is_stable():
             return np.inf
-        rate = self.J0 * np.exp(-self.B / (self.temperature * self.subcooling()**2))   # [1/h]
-        self._induction = self.rng.exponential(1 / rate) * 3600
+        labels = self.core.labels_at(self.core.injection_end) if labels is None else labels
+        area = self.interface_area(labels, self.core.voxel_size)
+        rate = self.J0 * area * np.exp(-self.B / (self.temperature * self.subcooling()**2))   # [1/h]
+        self._induction = self.rng.exponential(1 / rate) * 3600 if rate > 0 else np.inf
         return self._induction
 
     # ---- geometry of growth
@@ -309,37 +422,27 @@ class HydrateGrowth:
         nuclei.flat[self.rng.choice(sites, min(self.n_nuclei, sites.size), replace=False)] = True
         return nuclei
 
-    @staticmethod
-    def pore_distance(source, medium):
-        """
-        Distance [voxels] from `source` to every voxel of `medium`, moving only through `medium`
-        (so the growth front goes around grains, not through them). inf where it cannot get to.
-        """
-        step = ndi.generate_binary_structure(3, 2)               # 18 neighbours
-        dist = np.full(source.shape, np.inf)
-        dist[source] = 0
-        front, reached, k = source.copy(), source.copy(), 0
-        while front.any():
-            k += 1
-            front = ndi.binary_dilation(front, step) & medium & ~reached
-            dist[front] = k
-            reached |= front
-        return dist
-
     def arrival_time(self, labels, nuclei):
         """
         Time [s] after nucleation at which the growth front reaches each voxel, as the sum of
-          film spreading along the interface at constant speed:  d_nuc / (film_rate * dT)
+          film spreading along the interface at constant speed:   d_film / (film_rate * dT)
+            to the interface voxel nearest to this one
           thickening, limited by CO2 diffusing through the hydrate already formed, so the
-          thickness grows as sqrt(t):                             d_int^2 / (thickening_rate * dT)
-        d_nuc = distance from the nearest nucleus, d_int = distance from the water-CO2 interface [mm],
-        both measured through the pore space.
+          thickness grows as sqrt(t):                              d_int^2 / (thickening_rate * dT)
+        d_film = distance from the nearest nucleus measured along the interface layer (water and CO2 voxels
+        touching each other), d_int = distance from the water-CO2 interface through the pore space [mm].
         """
+        h = self.core.voxel_size
         water, co2 = labels == WATER, labels == CO2
-        d_int = np.where(water, self.pore_distance(co2, water), self.pore_distance(water, co2)) * self.core.voxel_size
-        d_nuc = self.pore_distance(nuclei, water | co2) * self.core.voxel_size
-        dT = self.subcooling()
-        return d_nuc / (self.film_rate * dT) + d_int**2 / (self.thickening_rate * dT)
+        band = (water & ndi.binary_dilation(co2)) | (co2 & ndi.binary_dilation(water))
+        t_film = pore_distance(nuclei, band, h) / (self.film_rate * self.subcooling())
+        # film time at the interface voxel closest to each voxel
+        _, idx = ndi.distance_transform_edt(~band, return_indices=True)
+        t_film = t_film[tuple(idx)]
+        d_int = np.where(water, pore_distance(co2, water, h), pore_distance(water, co2, h))
+        # random sub-voxel offset, so whole voxel layers don't convert at the same instant
+        d_int = np.maximum(d_int + self.rng.uniform(-0.5, 0.5, d_int.shape) * h, 0.1 * h)
+        return t_film + d_int**2 / (self.thickening_rate * self.subcooling())
 
     # ---- the growth itself
     def grow(self, start=None, duration=3600.0):
@@ -349,9 +452,12 @@ class HydrateGrowth:
         every water voxel converted makes room for (EXPANSION - 1) CO2 voxels next to the front to turn into
         hydrate too. Growth stops at max_conversion, or earlier if there is no CO2 left to expand into.
         """
-        start = self.core.injection_end if start is None else start
-        if start < self.core.injection_end:
-            raise ValueError("start hydrate growth after the CO2 injection has ended")
+        # the CO2 distribution stops changing at breakthrough or at the end of injection, whichever comes first
+        co2_settled = min(self.core.injection_end, getattr(self.core, "breakthrough_time", np.inf))
+        start = co2_settled if start is None else start
+        if start < co2_settled:
+            raise ValueError(f"start hydrate growth after the CO2 has settled (t = {co2_settled:.0f} s): "
+                             "breakthrough or end of injection")
         self.start, self.end = start, start + duration
         self.hydrate_time[:] = np.inf
         if not self.is_stable():
@@ -362,13 +468,19 @@ class HydrateGrowth:
             print("no water-CO2 interface: no hydrate")
             return
 
-        self.nucleation_time = start + self.induction_time()
+        self.nucleation_time = start + self.induction_time(labels)
+        if self.nucleation_time > self.end:
+            print(f"induction time {self.nucleation_time - start:.0f} s is longer than the growth window: no hydrate "
+                  "(raise J0 or duration, or set induction_time)")
+            return
         t = self.nucleation_time + self.arrival_time(labels, self.nucleate(labels))
 
         water = np.flatnonzero(labels == WATER)
         co2 = np.flatnonzero(labels == CO2)
         f = EXPANSION - 1
         n_w = min(int(self.max_conversion * water.size), int(co2.size / f))
+        if n_w == 0:
+            return
         water = water[np.argsort(t.flat[water], kind="stable")][:n_w]
         t_w = t.flat[water]
         co2 = co2[np.argsort(t.flat[co2], kind="stable")][:int(f * n_w)]
@@ -388,10 +500,11 @@ class HydrateGrowth:
 
     def mu_map(self, t, energy):
         """
-        Linear attenuation [1/mm] of every voxel at time t [s] and energy [keV]:
-        the core's map, with the voxels that have formed hydrate changed to the attenuation of hydrate.
+        Linear attenuation [1/mm] of every voxel at time t [s] and energy [keV], with the pore water as brine,
+        CO2 gas at its density at the growth pressure and temperature, and hydrate where it has formed.
+        Hydrate excludes salt, so in reality the remaining brine gets saltier as hydrate grows; not modelled here.
         """
-        mu_vox = self.core.mu_map(t, energy)
+        mu_vox = self.core.mu_map(t, energy, co2_density=self.co2_density)
         mu_vox[self.hydrate_time <= t] = mu("hydrate", energy)
         return mu_vox
 
@@ -448,17 +561,18 @@ if __name__ == "__main__":
     print(f"rock {core.rock.shape}, porosity {core.measured_porosity:.3f}  ({time.time() - t0:.1f} s)")
 
     core.set_start_water_saturation(1.0)
-    core.inject_co2(start=0, duration=300, pump_rate=0.1)
-    print(f"CO2 injected, S = {saturations(core.labels_at(300))}  ({time.time() - t0:.1f} s)")
+    core.inject_co2(start=0, duration=3900, pump_rate=0.1)
+    print(f"CO2 injected, S = {saturations(core.labels_at(3900))}  ({time.time() - t0:.1f} s)")
 
     hyd = HydrateGrowth(core, pressure=3.0, temperature=274.15, induction_time=120)
-    hyd.grow(start=300, duration=3600)
-    print(f"subcooling {hyd.subcooling():.1f} K, nucleation at {hyd.nucleation_time:.0f} s  ({time.time() - t0:.1f} s)")
-
+    hyd.grow(start=500, duration=3900)
+    nuc = getattr(hyd, "nucleation_time", None)
+    print(f"subcooling {hyd.subcooling():.1f} K, nucleation at "
+          f"{'none in window' if nuc is None or nuc > hyd.end else f'{nuc:.0f} s'}  ({time.time() - t0:.1f} s)")
     # every run gets its own folder, runs/<date>_<time>, next to this file
     run_dir = Path(__file__).parent / "runs" / datetime.now().strftime("%Y-%m-%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
-    times = [150, 300, 3900]           # times shown in the 3D figure
+    times = [150, 500, 3900]           # times shown in the 3D figure
     time_names = ["during injection", "end of injection", "end of growth"]
 
     # 1. the core in 3D at the three times
