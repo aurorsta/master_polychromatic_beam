@@ -193,7 +193,7 @@ def reconstruct(out_dir, geo, mode="dynamic", quality="high", enc_arc="mixedcube
         timesteps=geo["timesteps"] if mode == "dynamic" else None,
         mode="cone",
     )
-    return nect.reconstruct(geometry=geometry, projections=str(Path(out_dir) / "projections.npy"),
+    return nect.reconstruct(geometry=geometry, projections=str((Path(out_dir) / "projections.npy").resolve()),
                             mode=mode, quality=quality, enc_arc=enc_arc if mode == "dynamic" else None,
                             exp_name=Path(out_dir).name, **kwargs)
 
