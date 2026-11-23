@@ -1,0 +1,61 @@
+# Configurations for each run
+
+# Rock: minerals and their weight fractions. Names must be in MATERIALS 
+rock:
+  minerals:
+    quartz: 0.9170
+    feldspar: 0.0486
+    kaolinite: 0.0268
+
+# Injected fluid: CoolProp name (CO2, Nitrogen, Methane, ...) and chemical formula for attenuation
+fluid:
+  name: CO2
+  formula: {CO2: 1.0}
+
+# Core sample configurations
+core:
+  height_mm: 2.0              # core height [mm]. > 0. Voxels per side = size / voxel size
+  radius_mm: 1.0              # core radius [mm]. > 0. Keep below about 200 voxels per side (memory)
+  voxel_size_um: 10           # voxel edge length [um]. > 0. Micro-CT 1-20, medical CT 200-600
+  porosity: 0.23              # pore volume fraction [0-1]. Bentheimer 0.21-0.27
+  S_w: 1.0                    # initial brine saturation [0-1]. 1 = fully brine saturated (your experiments)
+  flow_rate: 8.0e-3           # CO2 injection rate [mm^3/s] at experiment P and T. > 0. Scale pump rate by area ratio
+  inlet_radius_mm: null       # radius of the inlet disc at the bottom [mm]. 0 < r <= radius_mm, null = radius / 4
+  residual_brine: 0.1         # brine film left in a voxel after CO2 enters [0-1]. Typical 0.05-0.3
+  blobiness: 2                # grain shape in PoreSpy blobs. Integer >= 1, larger = smaller, finer grains
+  seed: 0                     # random seed for the rock structure. Any integer, same seed = same rock
+  per_grain: false            # true = one mineral per grain, false = Bentheimer mixture in every solid voxel
+
+# Hydrate formation configurations
+hydrate:
+  formation_start: 20          # induction time before nucleation can start [s]. >= 0
+  timestep: 1.0               # time per step [s]. > 0. Total time = n_steps x timestep
+  temperature: 276.0          # [K]. 273-283 (range of the equilibrium fit, above freezing)
+  pressure: 3.0               # [MPa]. Above P_eq (about 1.4 at 274 K, 4.2 at 283 K). Below about 3.7 at 276 K for gaseous CO2
+  salinity: 3.5               # NaCl in the brine [wt%]. 0 = fresh water, 3.5 = seawater, keep below about 10
+  morphology_type: grain_coating  # where hydrate grows. grain_coating or pore_filling
+  memory_effect: false        # true = water has formed hydrate before, so induction time is shorter
+  memory_factor: 0.3          # induction time multiplier when memory_effect is true [0-1]
+  growth_rate: 0.9            # fraction of front brine converted per step [0-1]. Above about 0.8 the effect saturates
+  nucleation_probability: 0.1 # chance per candidate voxel per step of nucleating [0-1]
+  seed: 0                     # random seed for nucleation. Any integer
+
+# Simulation configurations
+simulation:
+  n_steps: 101                # number of time steps. Integer >= 1. Use 101 to include t = 100 s when save_every = 20
+  E_keV: 25                   # X-ray energy for the mu map [keV]. > 0. Micro-CT 20-160
+  save_every: 20              # save state and mu every n steps. Integer 1 to n_steps. Larger saves memory
+
+# New: settings for scan_gpu.py
+scan:
+  energy: 25                  # [keV]. 25 for a 2 mm core, about 30-35 for 4 mm
+  n_per_rev: 50               # projections per revolution
+  n_rev: 40                   # revolutions over the 100 s
+  I0: 1.0e+4                  # photons per pixel (noise level). null = no noise
+  n_truth: 11                  # ground-truth volumes saved, at 0, 20, ..., 100 s
+  # n_det left out: sized automatically to fit the core
+
+# New: settings for the NeCT reconstruction
+reconstruct:
+  quality: high
+  enc_arc: mixedcubes
