@@ -66,6 +66,14 @@ if __name__ == "__main__":
     truth_t = np.load(scan / "truth_times.npy")                  # [s]
     times = np.load(scan / "geometry.npz")["timesteps"]          # acquisition time of every projection [s]
 
+    # NeCT reads the projections again when exporting; point it to them with a full path
+    import re
+    cfg_file = model_dir / "config.yaml"
+    proj_path = str((scan / "projections.npy").resolve())
+    text = cfg_file.read_text()
+    text = re.sub(r"(?m)^img_path:.*$", f"img_path: {proj_path}", text)
+    cfg_file.write_text(text)
+
     # NeCT divides the timesteps by their maximum, so the truth times are converted the same way
     t_norm = [float(t / times.max()) for t in truth_t]
     vol_dir = nect.dynamic_export.export_volumes_at_timesteps(model_dir, t_norm)
