@@ -5,9 +5,30 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib.colors import ListedColormap
 
+import os
+from pathlib import Path
+from datetime import datetime
+import matplotlib
+ON_CLUSTER = "SLURM_JOB_ID" in os.environ
+if ON_CLUSTER:
+    matplotlib.use("Agg")                  # no screen on the cluster
+import matplotlib.pyplot as plt
+
+# One folder per run, inside the repo: figures/2026-11-24_1433/
+# One folder per script and run: figures/parallell_monochromatic_sim/2026-11-24_1548/
+FIG_DIR = (Path(__file__).resolve().parent / "figures" / Path(__file__).stem
+           / datetime.now().strftime("%Y-%m-%d_%H%M"))
+
+
+def finish(fig, name):
+    """Save the figure to FIG_DIR without showing it."""
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(FIG_DIR / f"{name}.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
 # One colour per material label; anything not listed is black
 PHASE_COLORS = {"vacuum": "white", "sandstone": "#b9975b", "water": "#3b7dd8",
-                "CO2 gas": "#f0c419", "hydrate": "#2ca58d"}
+                "CO2 gas": "#f0c419", "hydrate": "#f10808"}
 
 def simulation(img, pixel_size, theta_max=180, N0=None, seed=0):
     """Parallel beam, monochromatic. N0 = photons per detector pixel; None means no noise."""
@@ -23,7 +44,7 @@ def simulation(img, pixel_size, theta_max=180, N0=None, seed=0):
     return sinogram, recon, I, theta
 
 
-def simu_plots(img, sino, recon, I, n_pixel, pixel_size, theta):
+def simu_plots(img, sino, recon, I, n_pixel, pixel_size, theta, tag=""):
     L_img = n_pixel * pixel_size
     ext = (0, L_img, L_img, 0)                                     # image extent [mm]
     dtheta = theta[1] - theta[0]                                   # angle step [deg]
@@ -47,7 +68,7 @@ def simu_plots(img, sino, recon, I, n_pixel, pixel_size, theta):
     fig.colorbar(im2, ax=ax2, label=r"$\int \mu \, dl$")
 
     fig.tight_layout()
-    # plt.show()
+    finish(fig, f"{tag}_sinogram")
 
     # Intensity on the detector for a few angles
     fig, ax = plt.subplots(figsize=(6, 4.5))
@@ -60,7 +81,7 @@ def simu_plots(img, sino, recon, I, n_pixel, pixel_size, theta):
     # ax.set_yscale("log")                     # log scale shows low intensities better
     ax.legend()
     fig.tight_layout()
-    # plt.show()
+    finish(fig, f"{tag}detector_intensity")
 
     # Reconstruction and error
     error = recon - img
@@ -79,7 +100,7 @@ def simu_plots(img, sino, recon, I, n_pixel, pixel_size, theta):
         ax.set_xlabel("x [mm]")
     ax1.set_ylabel("y [mm]")
     fig.tight_layout()
-    plt.show()
+    finish(fig, f"{tag}_reconstruction")
 
 def plot_stages(stages, pixel_size):
     """stages: list of (labels, title) from Sample2D.growth_stages."""
@@ -101,7 +122,7 @@ def plot_stages(stages, pixel_size):
     handles = [Patch(color=cmap(i), label=NAMES[i]) for i in present if NAMES[i] != "vacuum"]
     fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False)
     fig.tight_layout(rect=(0, 0.08, 1, 1))
-    plt.show()
+    finish(fig, "hydrate_formation_stages")
 
 def contrast_table(energies=(40, 60, 80, 100, 140),
                    names=("water", "ice", "hydrate", "CO2 gas", "quartz", "sandstone")):
@@ -150,7 +171,7 @@ def error_plots(sample, pixel_size, energies=np.arange(20, 151, 10), N0=1e4):
     ax2.set_ylabel("RMS error in pores /\nhydrate–water contrast")
     ax2.set_title("Error relative to the hydrate contrast\n(below the dashed line hydrate stands out)")
     fig.tight_layout()
-    plt.show()
+    finish(fig, "error_plot")
 
 if __name__ == "__main__":
     ps, n, r, energy = 0.02, 300, 2.6, 60
@@ -169,8 +190,9 @@ if __name__ == "__main__":
     
 
 
-    for img in (simple_img, hydrate_img):
+    for tag, sample in (("simple", simple), ("rock", rock)):
+        img = sample.mu_map(energy)
         sino, recon, I, theta = simulation(img, ps, N0=None)
-        simu_plots(img, sino, recon, I, n, ps, theta)
-    
-    error_plots(rock, ps, N0=None)      
+        simu_plots(img, sino, recon, I, n, ps, theta, tag=tag)
+
+    error_plots(rock, ps, N0=None)    
