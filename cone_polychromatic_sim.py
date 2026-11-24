@@ -5,8 +5,7 @@ from xpecgen import xpecgen as xg
 from samples_2D import Sample2D, NAMES, LABEL, mu
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-from matplotlib.colors import ListedColormap
+
 import os
 from pathlib import Path
 from datetime import datetime
@@ -82,12 +81,14 @@ def simulation(sample, E, S, pixel_size, theta_max=2 * np.pi, n_angles=720, N0=N
     return proj, img_fdk, I, angles
 
 
-def simu_plots(img, proj, recon, I, n_pixel, pixel_size, angles, tag=""):
+def simu_plots(img, proj, recon, I, n_pixel, pixel_size, angles, tag="", vmax=None):
     # TIGRE output (n_angles, 1, n_det) -> (n_det, n_angles), same layout as radon
     sino = proj[:, 0, :].T
     I = I[:, 0, :].T
     theta = np.degrees(angles)                                     # [deg]
 
+    if vmax is None:
+        vmax = max(img.max(), np.percentile(recon, 99.9))
     L_img = n_pixel * pixel_size
     ext = (0, L_img, L_img, 0)                                     # image extent [mm]
     dtheta = theta[1] - theta[0]                                   # angle step [deg]
@@ -98,7 +99,7 @@ def simu_plots(img, proj, recon, I, n_pixel, pixel_size, angles, tag=""):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5))
 
     ax1.set_title("Original")
-    im1 = ax1.imshow(img, cmap="Greys_r", vmin=0, vmax=img.max(), extent=ext)
+    im1 = ax1.imshow(img, cmap="Greys_r", vmin=0, vmax=vmax, extent=ext)
     ax1.set_xlabel("x [mm]")
     ax1.set_ylabel("y [mm]")
     fig.colorbar(im1, ax=ax1, label=r"$\mu$ [1/mm]")
@@ -131,7 +132,7 @@ def simu_plots(img, proj, recon, I, n_pixel, pixel_size, angles, tag=""):
     lim = np.abs(error).max()                  # symmetric colour scale around zero
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), sharex=True, sharey=True)
 
-    im1 = ax1.imshow(recon, cmap="Greys_r", vmin=0, vmax=img.max(), extent=ext)
+    im1 = ax1.imshow(recon, cmap="Greys_r", vmin=0, vmax=vmax, extent=ext)
     ax1.set_title("Reconstruction\nFiltered back projection")
     fig.colorbar(im1, ax=ax1, label=r"$\mu$ [1/mm]")
 
@@ -145,6 +146,42 @@ def simu_plots(img, proj, recon, I, n_pixel, pixel_size, angles, tag=""):
     fig.tight_layout()
     finish(fig, f"{tag}_reconstruction")
 
+def bremsstrahlung_plot(kVps=(60, 100, 140), filter_mm_Al=1.0, n_points=50):
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for kVp in kVps:
+        E, S = energy_spectrum(kVp=kVp, filter_mm_Al=filter_mm_Al, n_points=n_points)
+        I = S / S.max()                                   # normalised so the spectra can be compared
+        E_eff = np.sum(E * S) / np.sum(S)                 # mean energy [keV]
+        line, = ax.plot(E, I, label=f"{kVp} kVp, mean {E_eff:.0f} keV")
+        ax.axvline(E_eff, color=line.get_color(), ls="--", lw=1)
+
+    ax.set_xlabel("Photon energy [keV]")
+    ax.set_ylabel("Relative photon count")
+    ax.set_title(f"Tungsten tube spectrum, {filter_mm_Al} mm Al filter")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.legend()
+    fig.tight_layout()
+    finish(fig, "spectrum")
+
+def pore_window_plot(img, recon, sample, pixel_size, tag="rock"):
+    """Reference and reconstruction with a narrow window on water and hydrate."""
+    hyd = sample.labels == LABEL["hydrate"]
+    wat = sample.labels == LABEL["water"]
+    mu_w, mu_h = img[wat].mean(), img[hyd].mean()
+    c = mu_h - mu_w                                  # hydrate-water contrast
+    vmin, vmax = mu_w - 3 * c, mu_h + 3 * c          # CO2 clips to black, sandstone to white
+
+    L = sample.n_pixel * pixel_size
+    ext = (0, L, L, 0)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), sharex=True, sharey=True)
+    for ax, im, title in ((ax1, img, "Reference"), (ax2, recon, "Reconstruction")):
+        h = ax.imshow(im, cmap="Greys_r", vmin=vmin, vmax=vmax, extent=ext)
+        ax.set_title(f"{title}\nwindow on pore fluids")
+        ax.set_xlabel("x [mm]")
+    ax1.set_ylabel("y [mm]")
+    fig.colorbar(h, ax=(ax1, ax2), label=r"$\mu$ [1/mm]")
+    finish(fig, f"{tag}_pore_window")
 
 def error_plots(sample, pixel_size, kVps=np.arange(40, 151, 10), filter_mm_Al=1.0, N0=1e4):
     """Reconstruction error against tube voltage for a sample from hydrate_growth. N0=None means no noise."""
@@ -179,7 +216,7 @@ def error_plots(sample, pixel_size, kVps=np.arange(40, 151, 10), filter_mm_Al=1.
                                                 lambda e: np.interp(e, E_effs, kVps)))
     top.set_xlabel("Mean energy [keV]")
     fig.tight_layout()
-    plt.show()
+    finish(fig, "error_vs_kVp")
 
 
 if __name__ == "__main__":
@@ -196,8 +233,12 @@ if __name__ == "__main__":
     E_eff = np.sum(E * S) / np.sum(S)                      # line 1: once, right after the spectrum
 
     for tag, sample in (("simple", simple), ("rock", rock)):
-        img = sample.mu_map(E_eff)                         # line 2: inside the loop
+        w = S / S.sum()
+        img = np.tensordot(w, sample.mu_map(E), axes=1)     # spectrum-weighted mu, (n, n)
+        # img = sample.mu_map(E_eff)                         # line 2: inside the loop
         proj, recon, I, angles = simulation(sample, E, S, ps)    # line 3
-        simu_plots(img, proj, recon, I, n, ps, angles, tag=tag)           # line 4
-
+        simu_plots(img, proj, recon, I, n, ps, angles, tag=tag, vmax=None)           # line 4
+        if tag == "rock":
+            pore_window_plot(img, recon, sample, ps, tag=tag)
     error_plots(rock, ps, N0=1e4)
+    bremsstrahlung_plot()
